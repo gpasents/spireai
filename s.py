@@ -94,7 +94,7 @@ class UnifiedAgentResponse(BaseModel):
     screen_type: Literal["combat", "map", "reward", "event", "unknown"]
     reasoning: str
     action_description: str
-    action: Literal["dpad_up", "dpad_down", "dpad_left", "dpad_right", "confirm", "cancel", "end_turn", "wait"]
+    action_sequence: List[Literal["dpad_up", "dpad_down", "dpad_left", "dpad_right", "confirm", "cancel", "end_turn", "wait"]]
 
 # ---------------------------------------------------------
 # FLOATING HUD OVERLAY
@@ -209,17 +209,17 @@ def run_unified_agent(client: genai.Client, game_img: Image.Image, state_summary
     You are playing Slay the Spire 2 using an XBOX CONTROLLER. Look for the glowing UI highlight/reticle to know your current cursor position.
     
     STEP 1: Classify the screen (combat, map, reward, event, unknown).
-    STEP 2: Determine the next single controller input.
+    STEP 2: Determine the sequence of controller inputs to execute ONE complete logical action.
 
     RULES:
-    1. Navigation: Output 'dpad_up', 'dpad_down', 'dpad_left', or 'dpad_right' to move the highlight.
-    2. Selection: Output 'confirm' to select the currently highlighted option.
-    3. COMBAT: To play a card: D-pad to the card -> 'confirm' -> D-pad to target -> 'confirm'. If energy is 0, output 'end_turn'.
-    4. MAP: ONLY pick paths connected by a dotted line.
-    5. REWARDS/SCREENS: You CANNOT use the D-pad to navigate to the "Proceed" or "Skip" buttons in the bottom right. If you are ready to move on, you MUST output 'end_turn' (this triggers the Y button shortcut).
-    6. MENUS: If stuck in a full-screen menu by mistake, output 'cancel'.
+    1. Navigation: Use 'dpad_up', 'dpad_down', 'dpad_left', or 'dpad_right' to move the highlight.
+    2. Selection: Use 'confirm' to select the currently highlighted option.
+    3. COMBAT: To play a card, output the full batch of inputs for that single play (e.g., dpad to card -> 'confirm' -> dpad to target -> 'confirm'). DO NOT batch multiple card plays together. Stop after ONE complete action/card play so the updated board state can be re-evaluated. If energy is 0, output a sequence with just 'end_turn'.
+    4. MAP: ONLY pick paths connected by a dotted line. Provide the sequence to navigate to and select the node.
+    5. REWARDS/SCREENS: You CANNOT use the D-pad to navigate to the "Proceed" or "Skip" buttons in the bottom right. If you are ready to move on, you MUST output a sequence with 'end_turn' (this triggers the Y button shortcut).
+    6. MENUS: If stuck in a full-screen menu by mistake, output a sequence with 'cancel'.
     """
-    prompt = f"{state_summary}\n{stuck_warning}\nDetermine the current screen type and the next controller input."
+    prompt = f"{state_summary}\n{stuck_warning}\nDetermine the current screen type and the full input sequence for the next logical action."
     
     config = types.GenerateContentConfig(
         system_instruction=system_instruction,
@@ -277,25 +277,26 @@ def ai_loop():
             
             stuck_warning = ""
             if stuck_counter >= 3:
-                stuck_warning = f"⚠️ WARNING: You have executed '{last_action_signature}' {stuck_counter} times and state has not changed. You are stuck. Output 'cancel' (B button) or choose a different action."
+                stuck_warning = f"⚠️ WARNING: You have executed the sequence '{last_action_signature}' {stuck_counter} times and state has not changed. You are stuck. Output 'cancel' (B button) or choose a different action."
 
             state_summary = GAME_STATE.get_summary_prompt()
 
             # Single API Call
             res = run_unified_agent(client, raw_image, state_summary, stuck_warning)
             screen_type = res.screen_type.lower()
-            act = res.action.lower()
+            action_seq = res.action_sequence
             reasoning = res.reasoning
             act_desc = res.action_description
 
             latency = round(time.time() - start_time, 2)
-            GAME_STATE.add_action(f"[{screen_type.upper()}] Action: {act.upper()} - {act_desc}")
+            GAME_STATE.add_action(f"[{screen_type.upper()}] Sequence: {', '.join(action_seq).upper()} - {act_desc}")
 
-            # Smart Stuck Detection (Ignores D-Pad movement)
-            current_sig = f"{screen_type}_{act}"
+            # Smart Stuck Detection (Ignores pure D-Pad movement)
+            current_sig = f"{screen_type}_{','.join(action_seq)}"
             directional_inputs = ["dpad_up", "dpad_down", "dpad_left", "dpad_right"]
             
-            if current_sig == last_action_signature and act not in directional_inputs and act != "wait":
+            is_pure_movement = all(a in directional_inputs for a in action_seq)
+            if current_sig == last_action_signature and not is_pure_movement and action_seq != ["wait"]:
                 stuck_counter += 1
             else:
                 stuck_counter = 0
@@ -316,7 +317,7 @@ def ai_loop():
 
             status_display = "● AUTOPILOT ACTIVE" if stuck_counter < 3 else f"● STUCK DETECTED ({stuck_counter}x)"
             status_col = "#00FF00" if stuck_counter < 3 else "#FF3330"
-            act_display = f"Action: {act.upper()} [{latency}s]"
+            act_display = f"Action: [{len(action_seq)} inputs] [{latency}s]"
             agent_display = f"{screen_type.upper()} Agent"
 
             if hud:
@@ -326,28 +327,34 @@ def ai_loop():
             print(f"🤖  Screen State: {screen_type.upper()}")
             print(f"⏱️   Latency:      {latency}s | Stuck Counter: {stuck_counter}")
             print(f"🧠  Reasoning:    {reasoning}")
-            print(f"🕹️   Action:       {act.upper()} | {act_desc}")
+            print(f"🕹️   Sequence:     {', '.join(action_seq).upper()} | {act_desc}")
             print("="*60 + "\n")
 
             # ---------------------------------------------------------
             # VIRTUAL CONTROLLER EXECUTION & DYNAMIC SLEEPS
             # ---------------------------------------------------------
-            if act in btn_map:
-                target_btn = btn_map[act]
-                GAMEPAD.press_button(button=target_btn)
-                GAMEPAD.update()
-                time.sleep(0.15)
-                GAMEPAD.release_button(button=target_btn)
-                GAMEPAD.update()
-                
-                # Fast sleep for D-pad scrolling, longer sleep for animations
-                if act in directional_inputs:
-                    time.sleep(0.3)
-                else:
-                    time.sleep(1.5)  
+            for i, act in enumerate(action_seq):
+                if not ai_active: 
+                    break # Allow hotkey interruption mid-sequence
+
+                if act in btn_map:
+                    target_btn = btn_map[act]
+                    GAMEPAD.press_button(button=target_btn)
+                    GAMEPAD.update()
+                    time.sleep(0.15)
+                    GAMEPAD.release_button(button=target_btn)
+                    GAMEPAD.update()
                     
-            elif act == "wait":
-                time.sleep(1.0)
+                    # Short delay between keypresses within a sequence
+                    if i < len(action_seq) - 1:
+                        time.sleep(0.2)
+                        
+                elif act == "wait":
+                    time.sleep(0.5)
+
+            # Longer sleep at the very end of the sequence for game animations to finish
+            if ai_active:
+                time.sleep(1.5)
 
         except Exception as e:
             err_msg = str(e)
@@ -378,7 +385,7 @@ if __name__ == "__main__":
     ==================================================
     🤖 Slay the Spire 2 Unified AI Copilot
     ==================================================
-    Architecture: Controller Only (No Mouse Interference)
+    Architecture: Controller Only (Macro Intents)
     Status      : STANDBY
     Toggle      : Press [{HOTKEY.upper()}] to engage/disengage AI.
     ==================================================
